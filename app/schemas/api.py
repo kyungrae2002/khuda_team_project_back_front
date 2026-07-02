@@ -19,6 +19,35 @@ class UploadResponse(BaseModel):
     raw_unparsed_count: int
 
 
+class SlotSummaryOut(BaseModel):
+    """Per-field snapshot for the frontend clarification flow: a field is
+    only non-null if the chat parse produced a `confirmed` value for it —
+    undecided/conflict/missing-entirely all come back as null so the
+    frontend knows exactly which fields still need to be asked about
+    directly."""
+
+    destination: str | None = None
+    date: str | None = None
+    budget: str | None = None
+    headcount: str | None = None
+    transport: str | None = None
+    constraint: list[str] | None = None
+    wishlist: list[str] | None = None
+
+
+class SlotFillRequest(BaseModel):
+    """Frontend echoes SlotSummaryOut back with the previously-null fields
+    filled in. Fields left null (or omitted) are left untouched."""
+
+    destination: str | None = None
+    date: str | None = None
+    budget: str | None = None
+    headcount: str | None = None
+    transport: str | None = None
+    constraint: list[str] | None = None
+    wishlist: list[str] | None = None
+
+
 class ItineraryRequest(BaseModel):
     days: int = 1
 
