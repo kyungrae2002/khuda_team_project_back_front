@@ -51,15 +51,50 @@ class SlotLike(Protocol):
     field: SlotField
     value: str
     status: SlotStatus
+    confidence: float
 
 
 class QueryBuildError(RuntimeError):
     """Raised when Google Places query generation fails after exhausting all retries."""
 
 
+def _best_slot(slots: Sequence[SlotLike], field: SlotField) -> SlotLike | None:
+    """A confirmed slot for this field if one exists, otherwise the
+    highest-confidence entry regardless of status (conflict/undecided) —
+    resolves a genuine disagreement in the conversation (e.g. two candidate
+    destinations neither side backed down on) by picking the most likely
+    option instead of blocking generation entirely."""
+    field_slots = [slot for slot in slots if slot.field == field]
+    if not field_slots:
+        return None
+    confirmed = [slot for slot in field_slots if slot.status == SlotStatus.confirmed]
+    if confirmed:
+        return confirmed[0]
+    return max(field_slots, key=lambda slot: slot.confidence)
+
+
+def resolve_slot_value(slots: Sequence[SlotLike], field: SlotField) -> str | None:
+    best = _best_slot(slots, field)
+    return best.value if best is not None else None
+
+
 def _find_missing_critical_slots(slots: Sequence[SlotLike]) -> list[SlotField]:
-    confirmed_fields = {slot.field for slot in slots if slot.status == SlotStatus.confirmed}
-    return [field for field in _CRITICAL_FIELDS if field not in confirmed_fields]
+    return [field for field in _CRITICAL_FIELDS if _best_slot(slots, field) is None]
+
+
+def _build_prompt_slots(slots: Sequence[SlotLike]) -> list[SlotLike]:
+    confirmed = [
+        slot
+        for slot in slots
+        if slot.status == SlotStatus.confirmed and slot.field in _RELEVANT_FIELDS
+    ]
+    confirmed_fields = {slot.field for slot in confirmed}
+    for field in _CRITICAL_FIELDS:
+        if field not in confirmed_fields:
+            best = _best_slot(slots, field)
+            if best is not None:
+                confirmed.append(best)
+    return confirmed
 
 
 def _format_slots(slots: Sequence[SlotLike]) -> str:
@@ -87,12 +122,7 @@ class QueryBuilder:
         if missing:
             return QueryBuildResult(missing_critical_slots=missing)
 
-        confirmed = [
-            slot
-            for slot in slots
-            if slot.status == SlotStatus.confirmed and slot.field in _RELEVANT_FIELDS
-        ]
-        prompt = _format_slots(confirmed)
+        prompt = _format_slots(_build_prompt_slots(slots))
 
         try:
             output: PlaceQueriesOutput = call_structured(

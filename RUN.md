@@ -5,7 +5,7 @@
 ## 0. 사전 준비물
 
 - Python 3.11+
-- Docker Desktop (Postgres 실행용)
+- Supabase 프로젝트 (Postgres DB) — [supabase.com](https://supabase.com)에서 무료로 생성 가능
 - OpenAI API 키 (`OPENAI_API_KEY`) — 슬롯 추출/쿼리 생성/장소 선별/일정 비평/서사화 전부 OpenAI 구조화 출력(`response_format: json_schema`, strict 모드) 사용
 - Google Places API (New) 키 (`GOOGLE_PLACES_API_KEY`) — Places Text Search / Nearby Search 권한 필요
 
@@ -13,27 +13,28 @@
 
 키가 없으면 `/health`와 DB 관련 기능은 동작하지만, `/sessions/upload`·`/sessions/{id}/itinerary`·`/evaluation`은 외부 API 호출 시점에 502 에러를 반환합니다.
 
-## 1. 환경 변수 설정
+## 1. Supabase 프로젝트 준비
+
+1. [supabase.com](https://supabase.com)에서 New project 생성 (Region은 가까운 곳으로)
+2. **Project Settings → Database → Database Password**에서 **Generate new password**로 비밀번호를 자동 생성하세요 (직접 입력하면 오타 위험이 있으니 자동 생성 권장)
+3. 같은 화면의 **Connection string → Session pooler** 탭에서 URI를 **Copy** 버튼으로 통째로 복사하세요 (비밀번호가 이미 채워진 채로 복사됩니다)
+   - Direct connection(IPv6 전용)이나 Transaction pooler(세션 상태 미유지)는 이 프로젝트의 동기 SQLAlchemy 커넥션 풀과 궁합이 안 좋을 수 있어 **Session pooler**를 권장합니다.
+
+## 2. 환경 변수 설정
 
 ```sh
 cp .env.example .env
 ```
 
-`.env`를 열어 아래 값을 채웁니다.
+`.env`를 열어 아래 값을 채웁니다. `DATABASE_URL`은 위에서 복사한 URI에서 `postgresql://`을 `postgresql+psycopg2://`로 바꿔서 넣으세요.
 
 ```
 OPENAI_API_KEY=sk-...
 GOOGLE_PLACES_API_KEY=AIza...
-DATABASE_URL=postgresql+psycopg2://postgres:postgres@localhost:5432/travel_buddy
+DATABASE_URL=postgresql+psycopg2://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres
 ```
 
-## 2. Postgres 기동
-
-```sh
-docker compose up -d
-```
-
-`docker ps`로 `travel-buddy-postgres` 컨테이너가 `Up` 상태인지 확인하세요.
+비밀번호에 `@`, `[`, `]` 등 URL 예약 문자가 포함되어 있으면 반드시 URL 인코딩(`urllib.parse.quote`)해서 넣어야 합니다. Supabase의 Copy 버튼으로 복사한 값은 인코딩되어 있지 않으니, 비밀번호에 특수문자가 있다면 직접 인코딩이 필요할 수 있습니다.
 
 ## 3. 백엔드 의존성 설치 + 마이그레이션
 
@@ -111,7 +112,9 @@ python -m unittest discover -s tests -v
 | `/sessions/{id}/itinerary`가 502 | Google Places API 키 문제이거나 OpenAI 호출 실패. 서버 로그의 상세 메시지 확인 |
 | `/sessions/upload` 응답은 오는데 슬롯이 이상함 | `DEFAULT_MODEL`이 계정에서 접근 불가한 모델일 수 있음. 서버 로그의 OpenAI 에러 메시지 확인 후 모델명 조정 |
 | Streamlit에서 "백엔드 호출 실패" | 백엔드가 8000번 포트에서 실행 중인지, `BACKEND_URL`이 맞는지 확인 |
-| `alembic upgrade head` 실패 | Postgres 컨테이너가 떠 있는지(`docker ps`), `.env`의 `DATABASE_URL`이 맞는지 확인 |
+| `alembic upgrade head` 실패 | `.env`의 `DATABASE_URL`이 맞는지, Supabase 프로젝트가 활성 상태인지 확인 |
+| DB 연결 시 `password authentication failed` | `.env`의 `DATABASE_URL` 비밀번호가 Supabase에 실제 저장된 값과 다름. Supabase 대시보드에서 비밀번호를 다시 생성하고 Connection string을 통째로 복사해 넣기 |
+| DB 연결 시 `could not translate host name` | 비밀번호에 `@`, `[`, `]` 등 URL 예약 문자가 있는데 인코딩이 안 됨. `urllib.parse.quote`로 비밀번호 부분만 인코딩 |
 
 ## 프로젝트 구조 요약
 
@@ -125,7 +128,8 @@ app/
                   동선 생성/검증/비평, 서사화, 파이프라인 오케스트레이션
 demo/
   app.py          Streamlit 데모 UI (requests로 백엔드 호출)
-alembic/          DB 마이그레이션
+alembic/          DB 마이그레이션 (Supabase Postgres 대상)
 tests/            유닛테스트 (전부 mock 기반, 인프라 불필요)
-docker-compose.yml  Postgres
 ```
+
+DB는 Supabase(관리형 Postgres)를 사용합니다. 로컬 docker-compose Postgres는 더 이상 쓰지 않습니다.
