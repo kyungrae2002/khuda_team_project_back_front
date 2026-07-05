@@ -2,6 +2,7 @@ from dataclasses import asdict
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.core.database import get_db
 from app.models.slot import Slot, SlotField
@@ -14,6 +15,7 @@ from app.schemas.api import (
     UploadResponse,
 )
 from app.services.itinerary_builder import ItineraryFixError
+from app.services.json_conversation_parser import ConversationJSONError
 from app.services.narrator import NarrationError
 from app.services.ingestion import ingest_conversation
 from app.services.place_selector import PlaceSelectionError
@@ -35,7 +37,11 @@ async def upload_conversation(
     content = (await file.read()).decode("utf-8")
 
     try:
-        result = ingest_conversation(db, title=file.filename or "새 여행", file_content=content)
+        result = await run_in_threadpool(
+            ingest_conversation, db, title=file.filename or "새 여행", file_content=content
+        )
+    except ConversationJSONError as exc:
+        raise HTTPException(status_code=422, detail=f"대화 파일 형식이 올바르지 않습니다: {exc}") from exc
     except SlotExtractionError as exc:
         raise HTTPException(status_code=502, detail=f"슬롯 추출에 실패했습니다: {exc}") from exc
 

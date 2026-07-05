@@ -7,6 +7,7 @@ by Google's place_id, so callers never see duplicate rows for the same
 place."""
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Sequence
 
@@ -238,15 +239,64 @@ def get_or_fetch_place(
     return places
 
 
+DEFAULT_BATCH_MAX_WORKERS = 8
+
+
 def batch_search(
     db: Session,
     queries: Sequence[PlaceQuery],
     *,
     location: tuple[float, float] | None = None,
     client: PlacesClient | None = None,
+    max_workers: int = DEFAULT_BATCH_MAX_WORKERS,
 ) -> list[list[Place]]:
+    """Same result as calling get_or_fetch_place once per query, but the
+    network leg for cache-misses runs concurrently across threads instead of
+    one request at a time — with 5-10+ queries per itinerary (one per meal
+    slot/day plus attractions), sequential requests were the dominant cost of
+    itinerary generation. The DB session itself isn't touched from worker
+    threads (SQLAlchemy Sessions aren't thread-safe); every cache read/write
+    still happens sequentially on the caller's thread, only the outbound
+    HTTP calls are parallelized. httpx.Client is documented as safe to share
+    across threads, so a single client is reused for all requests."""
     places_client = client or PlacesClient()
-    return [
-        get_or_fetch_place(db, query, location=location, client=places_client)
-        for query in queries
-    ]
+
+    cache_hits: dict[int, list[Place]] = {}
+    to_fetch: list[tuple[int, PlaceQuery]] = []
+    for index, query in enumerate(queries):
+        cached = _find_fresh_cache(db, query.query_text, query.search_type, query.category.value)
+        if cached is not None:
+            cache_hits[index] = _load_places_by_ids(db, cached.place_ids)
+        else:
+            to_fetch.append((index, query))
+
+    fetched: dict[int, list[dict] | None] = {}
+    if to_fetch:
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(to_fetch))) as executor:
+            future_to_index = {
+                executor.submit(places_client.search, query, location=location): index
+                for index, query in to_fetch
+            }
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                try:
+                    fetched[index] = future.result()
+                except ValueError:
+                    # e.g. a "nearby" query with no resolvable destination
+                    # location — skip it rather than failing the whole batch.
+                    fetched[index] = None
+
+    results: list[list[Place]] = [[] for _ in queries]
+    for index, query in to_fetch:
+        parsed_places = fetched[index]
+        if parsed_places is None:
+            continue
+        places = _upsert_places(db, parsed_places)
+        _record_search(
+            db, query.query_text, query.search_type, query.category.value,
+            [place.place_id for place in places],
+        )
+        results[index] = places
+    for index, places in cache_hits.items():
+        results[index] = places
+    return results

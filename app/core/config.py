@@ -13,7 +13,7 @@ class Settings:
     GOOGLE_PLACES_API_KEY: str = os.getenv("GOOGLE_PLACES_API_KEY", "")
     DATABASE_URL: str = os.getenv(
         "DATABASE_URL",
-        "postgresql+psycopg2://postgres:postgres@localhost:5432/travel_buddy",
+        "postgresql+psycopg://postgres:postgres@localhost:5432/travel_buddy",
     )
 
 

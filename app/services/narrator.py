@@ -44,6 +44,8 @@ class ItemNarrative:
     arrival_time_label: str  # natural Korean phrasing, e.g. "10시 23분"
     reservation_badge: str
     selection_reason: str | None
+    lat: float
+    lng: float
 
 
 @dataclass
@@ -58,7 +60,20 @@ class ItineraryNarrative:
     days: list[DayNarrative] = field(default_factory=list)
 
 
-def _time_period(t: dtime) -> str:
+_FOOD_PRIMARY_TYPES = frozenset({"restaurant", "cafe", "bakery"})
+
+
+def _time_period(t: dtime, place: Place | None = None) -> str:
+    """Buckets an arrival time into a display label. When `place` is a food
+    stop, distinguishes 아침/점심/저녁 from the surrounding 오전/오후 attraction
+    buckets so the frontend can tell a meal item apart from a sightseeing
+    item that merely happens to fall in the same half of the day."""
+    if place is not None and (place.primary_type or "") in _FOOD_PRIMARY_TYPES:
+        if t.hour < 11:
+            return "아침"
+        if t.hour < 15:
+            return "점심"
+        return "저녁"
     if t.hour < 12:
         return "오전"
     if t.hour < 18:
@@ -79,11 +94,13 @@ def _build_item_narrative(
     return ItemNarrative(
         place_id=item.place_id,
         place_name=place.name,
-        time_period=_time_period(item.arrival_time.time()),
+        time_period=_time_period(item.arrival_time.time(), place),
         arrival_time=item.arrival_time.isoformat(),
         arrival_time_label=_format_time_korean(item.arrival_time.time()),
         reservation_badge=_RESERVATION_BADGES[item.reservation_needed],
         selection_reason=selection_reasons.get(item.place_id),
+        lat=place.lat,
+        lng=place.lng,
     )
 
 
@@ -103,14 +120,16 @@ def _fallback_narrative(items: Sequence[ItemNarrative]) -> str:
 
 _SYSTEM_PROMPT = """당신은 확정된 여행 일정을 자연스러운 한국어 서사로 정리하는 도우미입니다.
 
-입력으로 day별 방문 장소 목록을 받습니다. 각 장소에는 시간대(오전/오후/저녁), 도착 시각,
+입력으로 day별 방문 장소 목록을 받습니다. 각 장소에는 시간대(아침/오전/점심/오후/저녁 중
+하나 — 아침·점심·저녁은 식사 장소, 오전·오후는 관광/활동 장소를 뜻합니다), 도착 시각,
 장소명, 예약 필요성 뱃지(필수/권장/불필요), 그리고 있다면 이 장소를 고른 이유가 함께
 주어집니다.
 
 규칙:
-1. 각 day에 대해 "N일차: 오전 - 장소A(도착 10시) → 오후 - 장소B(도착 14시 30분) → ..."
-   처럼 시간 흐름을 따라가는 자연스러운 문장으로 서술하세요. 방문 순서와 도착 시각은
-   주어진 데이터를 정확히 반영해야 합니다.
+1. 각 day에 대해 "N일차: 아침 - 장소A(도착 8시 30분) → 오전 - 장소B(도착 10시) → 점심 -
+   장소C(도착 12시 30분) → ..."처럼 시간 흐름을 따라가며 하루의 식사와 관광 리듬이
+   느껴지는 자연스러운 문장으로 서술하세요. 방문 순서와 도착 시각은 주어진 데이터를
+   정확히 반영해야 합니다.
 2. 오직 주어진 사실(장소명, 시간대, 도착 시각, 예약 필요성, 선정 이유)만 사용하세요.
    메뉴 추천, 실제로 주어지지 않은 세부 묘사, 방문하지 않은 장소 등 데이터에 없는
    내용을 지어내지 마세요.

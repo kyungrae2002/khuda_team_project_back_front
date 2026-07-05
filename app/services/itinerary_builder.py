@@ -24,13 +24,26 @@ DEFAULT_MAX_TOKENS = 4096
 DEFAULT_MAX_LLM_RETRIES = 2
 MAX_CRITIQUE_ITERATIONS = 2
 
-DEFAULT_DAY_START_TIME = time(9, 0)
+DEFAULT_DAY_START_TIME = time(8, 30)
 DEFAULT_DURATION_MINUTES = 90
 DEFAULT_AVERAGE_SPEED_KMH = 30.0
 # Slack added after travel, on top of the raw travel time, before the next
 # visit starts. Matches validator.check_buffer's default min_buffer_minutes,
 # so a freshly-built route doesn't trip the buffer check on its own.
 DEFAULT_BUFFER_MINUTES = 15.0
+
+# Places whose Google "primaryType" marks them as a meal stop rather than an
+# attraction — used to shape each day around a breakfast/lunch/dinner rhythm
+# instead of a purely geographic route.
+_FOOD_PRIMARY_TYPES = frozenset({"restaurant", "cafe", "bakery"})
+# Earliest arrival time enforced for the 1st/2nd/3rd food stop encountered in
+# a day (breakfast/lunch/dinner respectively); any further food stop that day
+# (e.g. a dessert cafe) gets no floor and just falls wherever the route puts it.
+_MEAL_FLOOR_TIMES: tuple[time, ...] = (time(8, 0), time(12, 0), time(18, 0))
+
+
+def _is_food(place: Place) -> bool:
+    return (place.primary_type or "") in _FOOD_PRIMARY_TYPES
 
 
 @dataclass
@@ -103,6 +116,31 @@ def _nearest_neighbor_order(places: Sequence[Place]) -> list[Place]:
     return ordered
 
 
+def _order_day_by_rhythm(places: Sequence[Place]) -> list[Place]:
+    """Orders a day's places around breakfast -> morning attraction(s) ->
+    lunch -> afternoon attraction(s) -> dinner, instead of a single
+    geography-only nearest-neighbor chain. Falls back to plain nearest-
+    neighbor ordering when the day has no food-type places at all."""
+    food = [p for p in places if _is_food(p)]
+    if not food:
+        return _nearest_neighbor_order(places)
+
+    attractions = [p for p in places if not _is_food(p)]
+    ordered_food = _nearest_neighbor_order(food)
+    meal_anchors, extra_food = ordered_food[:3], ordered_food[3:]
+
+    ordered_attractions = _nearest_neighbor_order(attractions)
+    midpoint = (len(ordered_attractions) + 1) // 2
+    morning_attractions = ordered_attractions[:midpoint]
+    afternoon_attractions = ordered_attractions[midpoint:]
+
+    breakfast = meal_anchors[0:1]
+    lunch = meal_anchors[1:2]
+    dinner = meal_anchors[2:3]
+
+    return [*breakfast, *morning_attractions, *lunch, *afternoon_attractions, *dinner, *extra_food]
+
+
 def _schedule_day_groups(
     day_groups: Sequence[Sequence[Place]],
     *,
@@ -118,6 +156,7 @@ def _schedule_day_groups(
         day_date = start_date + timedelta(days=day_index)
         current_time = datetime.combine(day_date, day_start_time)
         previous_place: Place | None = None
+        meal_count = 0
 
         for order_in_day, place in enumerate(group):
             if previous_place is not None:
@@ -126,6 +165,13 @@ def _schedule_day_groups(
                 )
                 travel_minutes = (travel_km / average_speed_kmh) * 60
                 current_time += timedelta(minutes=travel_minutes + buffer_minutes)
+
+            if _is_food(place):
+                if meal_count < len(_MEAL_FLOOR_TIMES):
+                    floor_dt = datetime.combine(day_date, _MEAL_FLOOR_TIMES[meal_count])
+                    if current_time < floor_dt:
+                        current_time = floor_dt
+                meal_count += 1
 
             period = get_opening_period(place, day_date)
             if period is not None:
@@ -160,7 +206,7 @@ def build_route(
     average_speed_kmh: float = DEFAULT_AVERAGE_SPEED_KMH,
     buffer_minutes: float = DEFAULT_BUFFER_MINUTES,
 ) -> list[ItineraryItem]:
-    day_groups = [_nearest_neighbor_order(cluster) for cluster in _kmeans_cluster(places, days)]
+    day_groups = [_order_day_by_rhythm(cluster) for cluster in _kmeans_cluster(places, days)]
     return _schedule_day_groups(
         day_groups,
         start_date=start_date or date.today(),

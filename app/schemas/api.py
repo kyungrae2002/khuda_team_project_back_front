@@ -60,6 +60,8 @@ class ItemNarrativeOut(BaseModel):
     arrival_time_label: str
     reservation_badge: str
     selection_reason: str | None
+    lat: float
+    lng: float
 
 
 class DayNarrativeOut(BaseModel):

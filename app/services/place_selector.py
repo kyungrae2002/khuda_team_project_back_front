@@ -102,18 +102,26 @@ def filter_by_score(
 
 _SYSTEM_PROMPT = """당신은 여행 일정에 포함할 장소를 후보 목록에서 골라주는 도우미입니다.
 
-입력으로 다음 두 가지를 받습니다:
-1. 후보 장소 목록 (place_id, 이름, 평점, 리뷰 수, 그리고 있다면 다른 확정 장소와의 거리(km))
-2. 대화에서 확정된 wishlist(먹킷리스트)와 constraint(제약사항) 슬롯
+입력으로 다음 세 가지를 받습니다:
+1. 여행 일수와 목표 장소 수 범위
+2. 후보 장소 목록 (place_id, 이름, 카테고리, 평점, 리뷰 수, 그리고 있다면 다른 확정 장소와의
+   거리(km))
+3. 대화에서 확정된 wishlist(먹킷리스트)와 constraint(제약사항) 슬롯
 
 규칙:
 1. 후보 목록에 있는 place_id만 선택하세요. 목록에 없는 장소를 지어내면 안 됩니다.
-2. 각 장소를 고른 이유(selection_reason)는 wishlist/constraint 슬롯의 실제 내용과 연결해
+2. 하루 일정은 "조식/오전 관광 → 중식 → 오후 관광 → 석식"의 리듬으로 채워집니다. 따라서
+   일수(N)만큼 각각 최소 1곳씩 조식용(카페/베이커리 등), 중식용(음식점), 석식용(음식점)
+   장소를 고르고, 관광/활동(관광명소/박물관/공원 등) 장소도 하루에 2~3곳 정도씩 되도록
+   넉넉히 고르세요. 제공된 목표 장소 수 범위를 만족하는 것을 우선하되, 그 기준을 만족할
+   후보가 부족하면 있는 만큼만 고르세요 — 후보에 없는 장소를 지어내면 안 됩니다.
+3. constraint(예: 알레르기, 식이 제한)에 맞지 않는 후보는 조식/중식/석식 어떤 슬롯이든
+   절대 선택하지 마세요. wishlist는 최대한 반영하되, constraint가 항상 우선합니다.
+4. 각 장소를 고른 이유(selection_reason)는 wishlist/constraint 슬롯의 실제 내용과 연결해
    한 문장으로 작성하세요. 막연한 칭찬("평점이 높아서")보다는 대화에서 드러난 취향과
    왜 이 장소가 그 취향에 맞는지를 설명하세요. 평점/리뷰수/거리 같은 객관적 지표도
    보조 근거로 함께 언급할 수 있습니다.
-3. 모든 후보를 다 고를 필요는 없습니다 — 대화 취향과 맞지 않는 후보는 제외해도 됩니다.
-4. wishlist/constraint 슬롯이 비어 있다면, 후보들의 평점/리뷰수/거리 등 객관적 기준만으로
+5. wishlist/constraint 슬롯이 비어 있다면, 후보들의 평점/리뷰수/거리 등 객관적 기준만으로
    한 문장씩 이유를 작성하세요.
 
 반드시 주어진 JSON 스키마에 맞는 형식으로만 응답하세요."""
@@ -124,6 +132,8 @@ def _format_candidates(candidates: Sequence[ScoredPlace]) -> str:
     for scored_place in candidates:
         place = scored_place.place
         parts = [f"place_id={place.place_id}", f"이름={place.name}"]
+        if place.primary_type:
+            parts.append(f"카테고리={place.primary_type}")
         if place.rating is not None:
             parts.append(f"평점={place.rating}")
         if place.review_count is not None:
@@ -145,8 +155,10 @@ def _format_slots(slots: Sequence[SlotLike]) -> str:
     return "\n".join(f"{slot.field.value}: {slot.value}" for slot in relevant)
 
 
-def _build_user_prompt(candidates: Sequence[ScoredPlace], slots: Sequence[SlotLike]) -> str:
+def _build_user_prompt(candidates: Sequence[ScoredPlace], slots: Sequence[SlotLike], days: int) -> str:
     return (
+        f"[여행 일수] {days}일\n"
+        f"[목표 장소 수] 최소 {days * 5}개, 최대 {days * 6}개\n\n"
         f"[후보 장소 목록]\n{_format_candidates(candidates)}\n\n"
         f"[대화에서 확정된 슬롯]\n{_format_slots(slots)}"
     )
@@ -169,12 +181,12 @@ class PlaceSelector:
         self._retry_delay_seconds = retry_delay_seconds
 
     def select(
-        self, candidates: Sequence[ScoredPlace], slots: Sequence[SlotLike]
+        self, candidates: Sequence[ScoredPlace], slots: Sequence[SlotLike], *, days: int = 1
     ) -> list[PlaceSelection]:
         if not candidates:
             return []
 
-        prompt = _build_user_prompt(candidates, slots)
+        prompt = _build_user_prompt(candidates, slots, days)
         valid_place_ids = {scored_place.place.place_id for scored_place in candidates}
 
         try:
@@ -202,6 +214,6 @@ place_selector = PlaceSelector()
 
 
 def select_places(
-    candidates: Sequence[ScoredPlace], slots: Sequence[SlotLike]
+    candidates: Sequence[ScoredPlace], slots: Sequence[SlotLike], *, days: int = 1
 ) -> list[PlaceSelection]:
-    return place_selector.select(candidates, slots)
+    return place_selector.select(candidates, slots, days=days)

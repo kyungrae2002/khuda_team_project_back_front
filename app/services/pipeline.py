@@ -18,7 +18,7 @@ from app.services.date_resolver import DateResolutionError, resolve_travel_date
 from app.services.itinerary_builder import ItineraryResult, build_and_validate_itinerary
 from app.services.narrator import ItineraryNarrative, narrate
 from app.services.place_selector import filter_by_score, select_places
-from app.services.places_client import get_or_fetch_place
+from app.services.places_client import batch_search, get_or_fetch_place
 from app.services.query_builder import build_place_queries, resolve_slot_value
 
 
@@ -31,6 +31,39 @@ class PipelineError(RuntimeError):
 class PipelineResult:
     narrative: ItineraryNarrative
     itinerary_result: ItineraryResult
+
+
+# Guaranteed category coverage on top of whatever the LLM-driven query_builder
+# derives from wishlist/constraint, so a day always has enough breakfast/lunch/
+# dinner and attraction candidates to choose from even when the conversation
+# only mentioned one or two specific wishlist items.
+_BASELINE_QUERY_TEMPLATES: tuple[tuple[str, PlaceCategory], ...] = (
+    ("{destination} 브런치 맛집", PlaceCategory.cafe),
+    ("{destination} 점심 맛집", PlaceCategory.restaurant),
+    ("{destination} 저녁 맛집", PlaceCategory.restaurant),
+    ("{destination} 가볼만한 곳", PlaceCategory.tourist_attraction),
+    ("{destination} 관광 명소", PlaceCategory.tourist_attraction),
+)
+
+
+def _build_baseline_queries(destination: str) -> list[PlaceQuery]:
+    return [
+        PlaceQuery(query_text=text.format(destination=destination), search_type="text", category=category)
+        for text, category in _BASELINE_QUERY_TEMPLATES
+    ]
+
+
+def _merge_queries(
+    llm_queries: Sequence[PlaceQuery], baseline_queries: Sequence[PlaceQuery]
+) -> list[PlaceQuery]:
+    seen = {(q.query_text, q.search_type, q.category) for q in llm_queries}
+    merged = list(llm_queries)
+    for query in baseline_queries:
+        key = (query.query_text, query.search_type, query.category)
+        if key not in seen:
+            seen.add(key)
+            merged.append(query)
+    return merged
 
 
 def _resolve_destination_location(
@@ -86,14 +119,13 @@ def generate_itinerary(
 
     location = _resolve_destination_location(db, slots)
 
+    destination = resolve_slot_value(slots, SlotField.destination)
+    baseline_queries = _build_baseline_queries(destination) if destination else []
+    search_queries = _merge_queries(query_result.queries, baseline_queries)
+
     candidate_places: list[Place] = []
-    for query in query_result.queries:
-        try:
-            candidate_places.extend(get_or_fetch_place(db, query, location=location))
-        except ValueError:
-            # e.g. a "nearby" query with no resolvable destination location —
-            # skip it rather than failing the whole itinerary.
-            continue
+    for places in batch_search(db, search_queries, location=location):
+        candidate_places.extend(places)
     unique_places = list({place.id: place for place in candidate_places}.values())
     if not unique_places:
         raise PipelineError("검색된 장소가 없습니다.")
@@ -102,7 +134,7 @@ def generate_itinerary(
     if not scored:
         raise PipelineError("평점/리뷰 수 기준을 만족하는 장소가 없습니다.")
 
-    selections = select_places(scored, slots)
+    selections = select_places(scored, slots, days=days)
     google_id_to_place = {scored_place.place.place_id: scored_place.place for scored_place in scored}
     selected_places = [
         google_id_to_place[selection.place_id]
