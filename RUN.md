@@ -26,12 +26,12 @@
 cp .env.example .env
 ```
 
-`.env`를 열어 아래 값을 채웁니다. `DATABASE_URL`은 위에서 복사한 URI에서 `postgresql://`을 `postgresql+psycopg2://`로 바꿔서 넣으세요.
+`.env`를 열어 아래 값을 채웁니다. `DATABASE_URL`은 위에서 복사한 URI에서 `postgresql://`을 `postgresql+psycopg://`로 바꿔서 넣으세요 (설치된 드라이버가 `psycopg2`가 아니라 `psycopg` v3이기 때문).
 
 ```
 OPENAI_API_KEY=sk-...
 GOOGLE_PLACES_API_KEY=AIza...
-DATABASE_URL=postgresql+psycopg2://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres
+DATABASE_URL=postgresql+psycopg://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres
 ```
 
 비밀번호에 `@`, `[`, `]` 등 URL 예약 문자가 포함되어 있으면 반드시 URL 인코딩(`urllib.parse.quote`)해서 넣어야 합니다. Supabase의 Copy 버튼으로 복사한 값은 인코딩되어 있지 않으니, 비밀번호에 특수문자가 있다면 직접 인코딩이 필요할 수 있습니다.
