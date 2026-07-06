@@ -9,6 +9,7 @@ explicitly instructed not to invent details (e.g. menu recommendations) that
 aren't present in the source data."""
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import time as dtime
 from typing import Sequence
@@ -19,6 +20,7 @@ from app.models.itinerary_item import ItineraryItem, ReservationNeeded
 from app.models.place import Place
 from app.schemas.narration import NarrativeOutput
 from app.services.llm_client import LLMCallError, call_structured, default_client
+from app.services.place_taxonomy import is_food_place
 
 DEFAULT_MODEL = "gpt-4o"
 DEFAULT_MAX_TOKENS = 4096
@@ -60,15 +62,12 @@ class ItineraryNarrative:
     days: list[DayNarrative] = field(default_factory=list)
 
 
-_FOOD_PRIMARY_TYPES = frozenset({"restaurant", "cafe", "bakery"})
-
-
 def _time_period(t: dtime, place: Place | None = None) -> str:
     """Buckets an arrival time into a display label. When `place` is a food
     stop, distinguishes 아침/점심/저녁 from the surrounding 오전/오후 attraction
     buckets so the frontend can tell a meal item apart from a sightseeing
     item that merely happens to fall in the same half of the day."""
-    if place is not None and (place.primary_type or "") in _FOOD_PRIMARY_TYPES:
+    if place is not None and is_food_place(place):
         if t.hour < 11:
             return "아침"
         if t.hour < 15:
@@ -120,27 +119,34 @@ def _fallback_narrative(items: Sequence[ItemNarrative]) -> str:
 
 _SYSTEM_PROMPT = """당신은 확정된 여행 일정을 자연스러운 한국어 서사로 정리하는 도우미입니다.
 
-입력으로 day별 방문 장소 목록을 받습니다. 각 장소에는 시간대(아침/오전/점심/오후/저녁 중
-하나 — 아침·점심·저녁은 식사 장소, 오전·오후는 관광/활동 장소를 뜻합니다), 도착 시각,
-장소명, 예약 필요성 뱃지(필수/권장/불필요), 그리고 있다면 이 장소를 고른 이유가 함께
-주어집니다.
+입력으로 day별 방문 장소 목록을 받습니다. 각 day 블록은 "[day_index=N]" 형식의 식별자로
+시작합니다 — 이 N은 그대로 응답 스키마의 day_index 필드에 사용할 내부 식별자일 뿐,
+사람이 읽는 "1일차/2일차" 같은 표시 번호가 아닙니다. 예를 들어 "[day_index=0]" 블록의
+narrative를 응답할 때는 day_index 필드에 반드시 0을 그대로 쓰세요 (1을 더하거나 빼지
+마세요). 각 장소에는 시간대(아침/오전/점심/오후/저녁 중 하나 — 아침·점심·저녁은 식사
+장소, 오전·오후는 관광/활동 장소를 뜻합니다), 도착 시각, 장소명, 예약 필요성 뱃지
+(필수/권장/불필요), 그리고 있다면 이 장소를 고른 이유가 함께 주어집니다.
 
 규칙:
-1. 각 day에 대해 "N일차: 아침 - 장소A(도착 8시 30분) → 오전 - 장소B(도착 10시) → 점심 -
-   장소C(도착 12시 30분) → ..."처럼 시간 흐름을 따라가며 하루의 식사와 관광 리듬이
-   느껴지는 자연스러운 문장으로 서술하세요. 방문 순서와 도착 시각은 주어진 데이터를
-   정확히 반영해야 합니다.
-2. 오직 주어진 사실(장소명, 시간대, 도착 시각, 예약 필요성, 선정 이유)만 사용하세요.
-   메뉴 추천, 실제로 주어지지 않은 세부 묘사, 방문하지 않은 장소 등 데이터에 없는
-   내용을 지어내지 마세요.
-3. 선정 이유가 주어진 장소는 왜 이 장소를 방문하는지 문장에 자연스럽게 녹여내세요.
-4. 예약 필요성이 "필수"인 장소는 예약이 필요하다는 점을 문장에서 짚어주세요.
+1. 각 day_index 블록에 대해 "아침 - 장소A(도착 8시 30분) → 오전 - 장소B(도착 10시) →
+   점심 - 장소C(도착 12시 30분) → ..."처럼 시간 흐름을 따라가며 하루의 식사와 관광
+   리듬이 느껴지는 자연스러운 문장으로 서술하세요. 방문 순서와 도착 시각은 주어진
+   데이터를 정확히 반영해야 합니다.
+2. narrative 문장 자체에는 "1일차"/"N일차" 같은 날짜 번호를 절대 넣지 마세요 — 그 번호는
+   프론트엔드가 day_index 필드로부터 별도로 만들어 붙입니다. 방문 순서와 시간 흐름만으로
+   자연스럽게 시작하세요.
+3. 오직 해당 day_index 블록에 실제로 주어진 장소만 언급하세요. 다른 day_index 블록의
+   장소, 목록에 없는 장소, 메뉴 추천이나 실제로 주어지지 않은 세부 묘사 등 데이터에
+   없는 내용을 지어내지 마세요. 블록에 장소가 1곳뿐이면 반드시 그 1곳만 언급하고
+   끝내세요 — 다른 곳을 추가로 지어내 채우면 안 됩니다.
+4. 선정 이유가 주어진 장소는 왜 이 장소를 방문하는지 문장에 자연스럽게 녹여내세요.
+5. 예약 필요성이 "필수"인 장소는 예약이 필요하다는 점을 문장에서 짚어주세요.
 
 반드시 주어진 JSON 스키마에 맞는 형식으로만 응답하세요."""
 
 
 def _format_day_facts(day_index: int, items: Sequence[ItemNarrative]) -> str:
-    lines = [f"[{day_index + 1}일차]"]
+    lines = [f"[day_index={day_index}]"]
     for item in items:
         reason_part = f", 선정 이유: {item.selection_reason}" if item.selection_reason else ""
         lines.append(
@@ -148,6 +154,29 @@ def _format_day_facts(day_index: int, items: Sequence[ItemNarrative]) -> str:
             f"(예약 {item.reservation_badge}{reason_part})"
         )
     return "\n".join(lines)
+
+
+_LEADING_DAY_LABEL_PATTERN = re.compile(r"^\s*\d+\s*일차\s*[:,]?\s*")
+
+
+def _with_day_prefix(day_index: int, narrative_text: str) -> str:
+    """Deterministically owns the "N일차:" prefix instead of trusting the
+    model to compute/echo it correctly — day_index + 1 is applied here in
+    code, and any day-label the model wrote anyway (despite rule 2) is
+    stripped first so it can never double up or show a stale number."""
+    stripped = _LEADING_DAY_LABEL_PATTERN.sub("", narrative_text, count=1)
+    return f"{day_index + 1}일차: {stripped}"
+
+
+def _is_narrative_grounded(narrative_text: str, items: Sequence[ItemNarrative]) -> bool:
+    """Cheap grounding check: the prompt requires exactly one '→' between
+    each consecutive stop, so a narrative with more arrows than the day
+    actually has stops is a strong signal the model described places beyond
+    what this day_index block was given (observed as content bleeding in
+    from a different day). When this trips, the caller falls back to the
+    fully deterministic narrative instead of trusting the LLM text."""
+    max_expected_arrows = max(0, len(items) - 1)
+    return narrative_text.count("→") <= max_expected_arrows
 
 
 def _build_prompt(items_by_day: dict[int, list[ItemNarrative]]) -> str:
@@ -189,14 +218,17 @@ class ItineraryNarrator:
 
         narrative_by_day = self._get_narrative_text(items_by_day)
 
-        days = [
-            DayNarrative(
-                day_index=day_index,
-                narrative=narrative_by_day.get(day_index) or _fallback_narrative(items),
-                items=items,
+        days = []
+        for day_index, items in sorted(items_by_day.items()):
+            llm_text = narrative_by_day.get(day_index)
+            text = llm_text if llm_text and _is_narrative_grounded(llm_text, items) else _fallback_narrative(items)
+            days.append(
+                DayNarrative(
+                    day_index=day_index,
+                    narrative=_with_day_prefix(day_index, text),
+                    items=items,
+                )
             )
-            for day_index, items in sorted(items_by_day.items())
-        ]
         return ItineraryNarrative(days=days)
 
     def _get_narrative_text(self, items_by_day: dict[int, list[ItemNarrative]]) -> dict[int, str]:

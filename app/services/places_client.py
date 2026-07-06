@@ -35,6 +35,13 @@ _OPERATIONAL_STATUS = "OPERATIONAL"
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_BASE_DELAY_SECONDS = 1.0
 DEFAULT_NEARBY_RADIUS_METERS = 5000.0
+# A text query like "제주도 점심 맛집" carries no geographic constraint of its
+# own — Google's text relevance ranking can still surface a same-themed
+# place hundreds of km away (observed: a "제주" fusion restaurant matched from
+# Seongnam). locationBias doesn't hard-exclude far results, but strongly
+# prefers this area; the hard guarantee is the post-fetch distance filter in
+# pipeline.py.
+DEFAULT_TEXT_LOCATION_BIAS_RADIUS_METERS = 60000.0
 DEFAULT_MAX_RESULT_COUNT = 20
 CACHE_FRESHNESS = timedelta(hours=24)
 
@@ -63,6 +70,14 @@ class PlacesClient:
         if query.search_type == "text":
             url = _TEXT_SEARCH_URL
             payload = {"textQuery": query.query_text, "includedType": query.category.value}
+            if location is not None:
+                lat, lng = location
+                payload["locationBias"] = {
+                    "circle": {
+                        "center": {"latitude": lat, "longitude": lng},
+                        "radius": DEFAULT_TEXT_LOCATION_BIAS_RADIUS_METERS,
+                    }
+                }
         else:
             if location is None:
                 raise ValueError("nearby 검색에는 location(lat, lng)이 필요합니다")

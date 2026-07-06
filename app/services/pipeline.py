@@ -4,6 +4,7 @@ Places API (cached) -> two-stage place selection -> route build + critique/fix
 loop -> narration. Keeps the API route thin and the individual services
 independently testable."""
 
+import logging
 from dataclasses import dataclass
 from datetime import date
 from typing import Sequence
@@ -15,11 +16,14 @@ from app.models.place import Place
 from app.models.slot import Slot, SlotField
 from app.schemas.query_builder import PlaceCategory, PlaceQuery
 from app.services.date_resolver import DateResolutionError, resolve_travel_date
+from app.services.geo import haversine_km
 from app.services.itinerary_builder import ItineraryResult, build_and_validate_itinerary
 from app.services.narrator import ItineraryNarrative, narrate
-from app.services.place_selector import filter_by_score, select_places
+from app.services.place_selector import ScoredPlace, filter_by_score, select_places
 from app.services.places_client import batch_search, get_or_fetch_place
 from app.services.query_builder import build_place_queries, resolve_slot_value
+
+logger = logging.getLogger(__name__)
 
 
 class PipelineError(RuntimeError):
@@ -64,6 +68,73 @@ def _merge_queries(
             seen.add(key)
             merged.append(query)
     return merged
+
+
+# A text search query carries no hard geographic constraint of its own —
+# Google's text relevance ranking can still surface a same-themed place
+# hundreds of km outside the destination (observed: a "제주" fusion
+# restaurant matched from Seongnam for a "제주도 점심 맛집" query). Anything
+# farther than this from the resolved destination anchor is rejected before
+# it ever reaches scoring/selection, rather than silently included.
+DEFAULT_MAX_DESTINATION_DISTANCE_KM = 100.0
+
+
+def _filter_by_destination_distance(
+    places: Sequence[Place],
+    location: tuple[float, float] | None,
+    *,
+    max_distance_km: float = DEFAULT_MAX_DESTINATION_DISTANCE_KM,
+) -> list[Place]:
+    if location is None:
+        return list(places)
+
+    anchor_lat, anchor_lng = location
+    kept: list[Place] = []
+    for place in places:
+        distance_km = haversine_km(anchor_lat, anchor_lng, place.lat, place.lng)
+        if distance_km > max_distance_km:
+            logger.warning(
+                "장소 '%s'(place_id=%s)가 목적지에서 %.0fkm 떨어져 있어 후보에서 제외합니다.",
+                place.name,
+                place.place_id,
+                distance_km,
+            )
+            continue
+        kept.append(place)
+    return kept
+
+
+# select_places is an LLM call instructed to pick at least days*5 places,
+# but that's prompt compliance, not a guarantee — an under-selection (seen:
+# 17-18 places for a 4-day trip, below the 20 minimum) leaves some days with
+# too few stops to reach evening regardless of how well the rest of the
+# pipeline schedules them. Deterministically top up to the same floor from
+# the highest-scoring remaining real candidates rather than trust the LLM
+# alone to hit the count.
+MIN_PLACES_PER_DAY = 5
+
+
+def _top_up_selected_places(
+    scored: Sequence[ScoredPlace],
+    selected_places: Sequence[Place],
+    days: int,
+    *,
+    min_per_day: int = MIN_PLACES_PER_DAY,
+) -> list[Place]:
+    target_min = days * min_per_day
+    topped_up = list(selected_places)
+    if len(topped_up) >= target_min:
+        return topped_up
+
+    selected_ids = {place.id for place in topped_up}
+    for scored_place in scored:  # already sorted descending by score
+        if len(topped_up) >= target_min:
+            break
+        if scored_place.place.id in selected_ids:
+            continue
+        topped_up.append(scored_place.place)
+        selected_ids.add(scored_place.place.id)
+    return topped_up
 
 
 def _resolve_destination_location(
@@ -127,6 +198,7 @@ def generate_itinerary(
     for places in batch_search(db, search_queries, location=location):
         candidate_places.extend(places)
     unique_places = list({place.id: place for place in candidate_places}.values())
+    unique_places = _filter_by_destination_distance(unique_places, location)
     if not unique_places:
         raise PipelineError("검색된 장소가 없습니다.")
 
@@ -143,6 +215,8 @@ def generate_itinerary(
     ]
     if not selected_places:
         raise PipelineError("대화 취향에 맞는 장소가 선정되지 않았습니다.")
+
+    selected_places = _top_up_selected_places(scored, selected_places, days)
 
     selection_reasons = {
         google_id_to_place[selection.place_id].id: selection.selection_reason

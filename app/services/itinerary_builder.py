@@ -17,6 +17,7 @@ from app.schemas.itinerary_fix import ItineraryFixSuggestion
 from app.services.geo import haversine_km
 from app.services.llm_client import LLMCallError, call_structured, default_client
 from app.services.opening_hours import get_opening_period
+from app.services.place_taxonomy import is_food_place
 from app.services.validator import Violation, run_all_validators
 
 DEFAULT_MODEL = "gpt-4o"
@@ -32,18 +33,10 @@ DEFAULT_AVERAGE_SPEED_KMH = 30.0
 # so a freshly-built route doesn't trip the buffer check on its own.
 DEFAULT_BUFFER_MINUTES = 15.0
 
-# Places whose Google "primaryType" marks them as a meal stop rather than an
-# attraction — used to shape each day around a breakfast/lunch/dinner rhythm
-# instead of a purely geographic route.
-_FOOD_PRIMARY_TYPES = frozenset({"restaurant", "cafe", "bakery"})
 # Earliest arrival time enforced for the 1st/2nd/3rd food stop encountered in
 # a day (breakfast/lunch/dinner respectively); any further food stop that day
 # (e.g. a dessert cafe) gets no floor and just falls wherever the route puts it.
 _MEAL_FLOOR_TIMES: tuple[time, ...] = (time(8, 0), time(12, 0), time(18, 0))
-
-
-def _is_food(place: Place) -> bool:
-    return (place.primary_type or "") in _FOOD_PRIMARY_TYPES
 
 
 @dataclass
@@ -104,6 +97,51 @@ def _kmeans_cluster(
     return clusters
 
 
+def _cluster_centroid(cluster: Sequence[Place]) -> tuple[float, float] | None:
+    if not cluster:
+        return None
+    return (
+        sum(p.lat for p in cluster) / len(cluster),
+        sum(p.lng for p in cluster) / len(cluster),
+    )
+
+
+def _balance_clusters(clusters: Sequence[Sequence[Place]]) -> list[list[Place]]:
+    """_kmeans_cluster groups purely by geography, which can leave one day
+    with 2 places and another with 6 purely by happenstance of where
+    candidates happened to cluster — starving the thin day of enough stops
+    to reach evening regardless of how well-classified/scheduled those stops
+    are. Repeatedly moves the item from the largest cluster nearest to the
+    smallest cluster's centroid until every cluster is within 1 of the
+    others, so day size no longer depends on geographic luck."""
+    balanced = [list(cluster) for cluster in clusters]
+    k = len(balanced)
+    if k < 2:
+        return balanced
+
+    while True:
+        smallest_idx = min(range(k), key=lambda i: len(balanced[i]))
+        largest_idx = max(range(k), key=lambda i: len(balanced[i]))
+        if len(balanced[largest_idx]) - len(balanced[smallest_idx]) <= 1:
+            break
+
+        target_centroid = _cluster_centroid(balanced[smallest_idx])
+        if target_centroid is None:
+            # Empty target cluster: just take one place, any place, from the
+            # largest — there's no centroid yet to pick "nearest" by.
+            moved = balanced[largest_idx].pop()
+        else:
+            nearest = min(
+                balanced[largest_idx],
+                key=lambda p: haversine_km(p.lat, p.lng, *target_centroid),
+            )
+            balanced[largest_idx].remove(nearest)
+            moved = nearest
+        balanced[smallest_idx].append(moved)
+
+    return balanced
+
+
 def _nearest_neighbor_order(places: Sequence[Place]) -> list[Place]:
     if not places:
         return []
@@ -121,11 +159,11 @@ def _order_day_by_rhythm(places: Sequence[Place]) -> list[Place]:
     lunch -> afternoon attraction(s) -> dinner, instead of a single
     geography-only nearest-neighbor chain. Falls back to plain nearest-
     neighbor ordering when the day has no food-type places at all."""
-    food = [p for p in places if _is_food(p)]
+    food = [p for p in places if is_food_place(p)]
     if not food:
         return _nearest_neighbor_order(places)
 
-    attractions = [p for p in places if not _is_food(p)]
+    attractions = [p for p in places if not is_food_place(p)]
     ordered_food = _nearest_neighbor_order(food)
     meal_anchors, extra_food = ordered_food[:3], ordered_food[3:]
 
@@ -166,7 +204,7 @@ def _schedule_day_groups(
                 travel_minutes = (travel_km / average_speed_kmh) * 60
                 current_time += timedelta(minutes=travel_minutes + buffer_minutes)
 
-            if _is_food(place):
+            if is_food_place(place):
                 if meal_count < len(_MEAL_FLOOR_TIMES):
                     floor_dt = datetime.combine(day_date, _MEAL_FLOOR_TIMES[meal_count])
                     if current_time < floor_dt:
@@ -206,7 +244,8 @@ def build_route(
     average_speed_kmh: float = DEFAULT_AVERAGE_SPEED_KMH,
     buffer_minutes: float = DEFAULT_BUFFER_MINUTES,
 ) -> list[ItineraryItem]:
-    day_groups = [_order_day_by_rhythm(cluster) for cluster in _kmeans_cluster(places, days)]
+    clusters = _balance_clusters(_kmeans_cluster(places, days))
+    day_groups = [_order_day_by_rhythm(cluster) for cluster in clusters]
     return _schedule_day_groups(
         day_groups,
         start_date=start_date or date.today(),

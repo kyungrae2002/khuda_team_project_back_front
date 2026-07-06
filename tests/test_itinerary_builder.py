@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 from app.models.itinerary_item import ItineraryItem, ReservationNeeded
 from app.models.place import Place
 from app.services.itinerary_builder import (
+    _balance_clusters,
     _kmeans_cluster,
     _nearest_neighbor_order,
     build_route,
@@ -53,6 +54,48 @@ class TestKMeansCluster(unittest.TestCase):
         clusters = _kmeans_cluster(places, k=5)
 
         self.assertEqual(len(clusters), 2)
+
+
+class TestBalanceClusters(unittest.TestCase):
+    def test_evens_out_a_lopsided_split(self) -> None:
+        # Regression test: geography-only kmeans can leave one day with 2
+        # places and another with 6 purely by happenstance, starving the
+        # thin day of enough stops to reach evening.
+        thin = [_place(1, 0.0, 0.0), _place(2, 0.0, 0.1)]
+        rich = [_place(i, 10.0, 10.0 + i * 0.01) for i in range(3, 9)]
+
+        balanced = _balance_clusters([thin, rich])
+
+        sizes = sorted(len(c) for c in balanced)
+        self.assertEqual(sum(sizes), 8)
+        self.assertLessEqual(sizes[-1] - sizes[0], 1)
+
+    def test_leaves_already_balanced_clusters_untouched(self) -> None:
+        a = [_place(1, 0.0, 0.0), _place(2, 0.0, 0.1)]
+        b = [_place(3, 10.0, 10.0), _place(4, 10.0, 10.1)]
+
+        balanced = _balance_clusters([a, b])
+
+        self.assertEqual({p.id for p in balanced[0]}, {1, 2})
+        self.assertEqual({p.id for p in balanced[1]}, {3, 4})
+
+    def test_single_cluster_is_a_no_op(self) -> None:
+        only = [_place(1, 0.0, 0.0)]
+
+        balanced = _balance_clusters([only])
+
+        self.assertEqual(len(balanced), 1)
+        self.assertEqual(len(balanced[0]), 1)
+
+    def test_handles_an_initially_empty_cluster(self) -> None:
+        empty: list[Place] = []
+        rich = [_place(i, 0.0, float(i)) for i in range(1, 5)]
+
+        balanced = _balance_clusters([empty, rich])
+
+        sizes = sorted(len(c) for c in balanced)
+        self.assertEqual(sum(sizes), 4)
+        self.assertLessEqual(sizes[-1] - sizes[0], 1)
 
 
 class TestNearestNeighborOrder(unittest.TestCase):

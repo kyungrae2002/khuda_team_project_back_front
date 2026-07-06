@@ -81,6 +81,21 @@ class TestPlacesClientParsing(unittest.TestCase):
         call = fake_http.post.call_args
         self.assertEqual(call.args[0], "https://places.googleapis.com/v1/places:searchText")
         self.assertEqual(call.kwargs["json"]["textQuery"], "부산 회 맛집")
+        self.assertNotIn("locationBias", call.kwargs["json"])
+
+    def test_text_search_applies_location_bias_when_location_given(self) -> None:
+        # Regression test: a bare text query like "부산 회 맛집" carries no
+        # geographic constraint of its own, so Google's text relevance
+        # ranking can surface a same-themed place hundreds of km away. When a
+        # destination anchor is available, it must be passed as a bias.
+        fake_http = MagicMock()
+        fake_http.post.return_value = _make_response(200, {"places": []})
+        client = PlacesClient(api_key="test-key", http_client=fake_http)
+
+        client.search(_sample_query("text"), location=(35.1, 129.0))
+
+        circle = fake_http.post.call_args.kwargs["json"]["locationBias"]["circle"]
+        self.assertEqual(circle["center"], {"latitude": 35.1, "longitude": 129.0})
 
     def test_nearby_search_requires_location(self) -> None:
         client = PlacesClient(api_key="test-key", http_client=MagicMock())

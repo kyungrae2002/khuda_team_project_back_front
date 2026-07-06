@@ -11,7 +11,9 @@ from app.services.narrator import (
     NarrationError,
     _fallback_narrative,
     _format_time_korean,
+    _is_narrative_grounded,
     _time_period,
+    _with_day_prefix,
     export_json,
     export_markdown,
     narrate,
@@ -121,7 +123,60 @@ class TestNarratorPipeline(unittest.TestCase):
         result = narrator.narrate(itinerary, places_by_id, selection_reasons)
 
         self.assertEqual(len(result.days), 1)
-        self.assertEqual(result.days[0].narrative, "실제 1일차 서사")
+        self.assertEqual(result.days[0].narrative, "1일차: 실제 1일차 서사")
+
+    def test_corrects_wrong_day_number_the_model_wrote_in_prose(self) -> None:
+        # Regression test: the model echoing the displayed "[day_index=N]"
+        # block number back into its day_index field is filtered out by
+        # valid_day_indices, but if it also writes a (wrong) day number
+        # inside the narrative prose itself, that must still be corrected
+        # rather than shown to the user as-is.
+        itinerary, places_by_id, selection_reasons = self._sample_itinerary()
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = text_response(
+            {"days": [{"day_index": 0, "narrative": "9일차: 오전 - 장소A(도착 10시) → 오후 - 장소B(도착 14시 30분)"}]}
+        )
+        narrator = ItineraryNarrator(client=fake_client, max_retries=1, retry_delay_seconds=0)
+
+        result = narrator.narrate(itinerary, places_by_id, selection_reasons)
+
+        self.assertEqual(
+            result.days[0].narrative,
+            "1일차: 오전 - 장소A(도착 10시) → 오후 - 장소B(도착 14시 30분)",
+        )
+
+    def test_falls_back_when_narrative_describes_more_stops_than_this_day_has(self) -> None:
+        # Regression test for content bleeding in from a different day_index
+        # block: this day only has 1 real item, so a narrative chaining
+        # several "->" stops together can't be grounded in what was actually
+        # given to the model for this day and must be discarded.
+        places_by_id = {1: _place(1, "발랑드보통 제주")}
+        itinerary = [_item(1, 3, 0, datetime(2025, 7, 4, 8, 30))]
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = text_response(
+            {
+                "days": [
+                    {
+                        "day_index": 3,
+                        "narrative": (
+                            "아침 - 카페0(도착 8시 30분) → 오전 - 관광지0(도착 10시) → "
+                            "점심 - 맛집0(도착 12시 30분) → 오후 - 관광지1(도착 15시) → "
+                            "저녁 - 맛집1(도착 18시)"
+                        ),
+                    }
+                ]
+            }
+        )
+        narrator = ItineraryNarrator(client=fake_client, max_retries=1, retry_delay_seconds=0)
+
+        result = narrator.narrate(itinerary, places_by_id, {})
+
+        self.assertEqual(len(result.days), 1)
+        day = result.days[0]
+        self.assertEqual(day.day_index, 3)
+        # 4일차 (day_index 3 + 1), and only the real item — not the
+        # borrowed 5-stop narrative the model produced.
+        self.assertEqual(day.narrative, "4일차: 오전 - 발랑드보통 제주(도착 8시 30분)")
 
     def test_retries_then_raises_on_persistent_invalid_json(self) -> None:
         itinerary, places_by_id, selection_reasons = self._sample_itinerary()
