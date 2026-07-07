@@ -44,7 +44,7 @@ DEFAULT_NEARBY_RADIUS_METERS = 5000.0
 # Seongnam). locationBias doesn't hard-exclude far results, but strongly
 # prefers this area; the hard guarantee is the post-fetch distance filter in
 # pipeline.py.
-DEFAULT_TEXT_LOCATION_BIAS_RADIUS_METERS = 60000.0
+DEFAULT_TEXT_LOCATION_BIAS_RADIUS_METERS = 50000.0
 DEFAULT_MAX_RESULT_COUNT = 20
 CACHE_FRESHNESS = timedelta(hours=24)
 
