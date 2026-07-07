@@ -6,6 +6,7 @@ the last 24 hours. Results are always upserted into the Place table, keyed
 by Google's place_id, so callers never see duplicate rows for the same
 place."""
 
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,8 @@ from app.core.config import settings
 from app.models.place import Place
 from app.models.place_search_cache import PlaceSearchCache
 from app.schemas.query_builder import PlaceQuery
+
+logger = logging.getLogger(__name__)
 
 _TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
 _NEARBY_SEARCH_URL = "https://places.googleapis.com/v1/places:searchNearby"
@@ -299,6 +302,13 @@ def batch_search(
                 except ValueError:
                     # e.g. a "nearby" query with no resolvable destination
                     # location — skip it rather than failing the whole batch.
+                    fetched[index] = None
+                except PlacesAPIError as exc:
+                    # A single malformed/rejected query (e.g. Google returns
+                    # 400 for one category/text combination) shouldn't sink
+                    # the whole itinerary request when other queries in the
+                    # same batch succeed — skip just this one.
+                    logger.warning("Places search skipped for query %r: %s", queries[index], exc)
                     fetched[index] = None
 
     results: list[list[Place]] = [[] for _ in queries]
